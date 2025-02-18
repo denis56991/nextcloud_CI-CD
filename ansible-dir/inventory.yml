@@ -1,0 +1,7 @@
+---
+all:
+  children:
+    file-srv: # Группа серверов
+      hosts:
+        nc-srv: # Хост
+          ansible_host: IP-address

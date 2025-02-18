@@ -1,0 +1,254 @@
+---
+- name: Install nextcloud
+  hosts: file-srv
+  become: true
+
+  vars:
+    # Пароли зашифрованы через ansible-vault encrypt_string, пароль для расшифровки хранится в переменной gitlab и передается в .gitlab-ci.yml
+    mysql_test_db: "yes"
+    mariadb_root_pass: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          36323133346633633136373432653334343062653763623664323263313634353235663063656134
+          6361396533353037373565613337396364663065373537390a383161626333363237383433366631
+          34663434373938356566306665303066623364363365366437666234396139363838356533316231
+          6532643739306233360a393133356431303864363062306561373735623531376665363035643639
+          3338
+    packages_install:
+    - apache2
+    - mariadb-server
+    - libapache2-mod-php
+    - php-gd
+    - php-mysql
+    - php-curl
+    - php-mbstring
+    - php-intl
+    - php-gmp
+    - php-bcmath
+    - php-xml
+    - php-imagick
+    - php-zip
+    - php-apcu
+    - php-json
+    - php-common
+    - php-xmlrpc
+    - php-pear
+    - php-dev
+    - php-cli
+    - php-ldap
+    - php-bz2
+    - unzip
+    - curl
+    - python3-dev
+    - default-libmysqlclient-dev
+    - build-essential
+    - python3-pymysql
+    nextcloud_db_name: 'nextcloud'
+    nextcloud_db_user: 'nextclouduser'
+    nextcloud_db_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          64313461313864326538623961386437656531326161393232396338343031306136373034363333
+          6431656537633863346465393131663562333064613939380a343566386236623533653532616634
+          65656466353261656439343565303161346432303836366638383234396637336434636333363430
+          3237663430623036640a363066306463623137336239646265316364376438303065333831376561
+          3832
+
+  tasks:
+  # Устанавливаем пакеты для работы сервиса
+  - name: Install package
+    ansible.builtin.apt:
+      name: '{{ packages_install }}'
+      state: present
+    when: ansible_facts.packages is not defined or ansible_facts.packages | map(attribute='name') | list | difference(packages_install) | length > 0
+
+  # Проводим начальную настройку mariadb с помощью коллекции community.mysql
+  - name: Start settings mariadb deb
+    block:
+
+      # Забираем статус деманов
+      - name: Gather service facts
+        ansible.builtin.service_facts:
+
+      # Запускаем демон, если еще не запущен
+      - name: Start and enable mariadb
+        ansible.builtin.service:
+          name: mariadb
+          state: started
+          enabled: true
+        when: >
+          'mariadb' not in ansible_facts.services or
+          ansible_facts.services['mariadb'].state != 'running'
+
+      # Проверяем установлен ли пароль на root в mariadb
+      - name: Check if root user exists with password
+        community.mysql.mysql_query:
+          login_user: root
+          login_password: ""
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          query: "SELECT 1;"
+        register: root_password_check
+        ignore_errors: true
+        changed_when: false
+
+      # Ставим пароль на root в mariadb если пароля нет
+      - name: Set root password
+        community.mysql.mysql_user:
+          name: root
+          password: "{{ mariadb_root_pass }}"
+          check_implicit_admin: true
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          state: present
+        when: >
+          root_password_check is success and
+          root_password_check.query_result[0][0]["1"] == 1
+
+      # Удаляем тестовую базу
+      - name: Remove test database
+        community.mysql.mysql_db:
+          login_user: root
+          login_password: "{{ mariadb_root_pass }}"
+          login_host: localhost
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          name: test
+          state: absent
+        when: mysql_test_db == "yes"
+
+      # Проверяем существует ли база для nextcloud
+      - name: Check if Nextcloud database exists
+        community.mysql.mysql_query:
+          login_user: root
+          login_password: "{{ mariadb_root_pass }}"
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          query: "SHOW DATABASES;"
+        register: databases_check
+        changed_when: false
+
+      # Создаём базу для nextcloud, если её нет
+      - name: Create Nextcloud database if it doesn't exist
+        community.mysql.mysql_db:
+          login_user: root
+          login_password: "{{ mariadb_root_pass }}"
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          name: "{{ nextcloud_db_name }}"
+          state: present
+        when: >
+          nextcloud_db_name not in databases_check.query_result[0] | map(attribute='Database') | list
+
+      # Проверяем существует ли юзер для nextcloud
+      - name: Check if Nextcloud database user exists
+        community.mysql.mysql_query:
+          login_user: root
+          login_password: "{{ mariadb_root_pass }}"
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          query: "SELECT User FROM mysql.user WHERE User = '{{ nextcloud_db_user }}';"
+        register: user_check
+        changed_when: false
+
+      # Создаём юзера для nextcloud, если его нет
+      - name: Create Nextcloud database user if it doesn't exist
+        community.mysql.mysql_user:
+          login_user: root
+          login_password: "{{ mariadb_root_pass }}"
+          login_unix_socket: /var/run/mysqld/mysqld.sock
+          name: "{{ nextcloud_db_user }}"
+          password: "{{ nextcloud_db_password }}"
+          host: localhost
+          priv: "{{ nextcloud_db_name }}.*:ALL,GRANT"
+          state: present
+        notify: Reloaded privileges
+        when: >
+          nextcloud_db_user not in user_check.query_result[0] | map(attribute='User') | list
+
+  # Проверяем есть ли уже данные nextcloud, если есть, то пропускаем этот блок
+  - name: Check Nextcloud files
+    ansible.builtin.stat:
+      path: /var/www/html/nextcloud
+    register: nextcloud_stat
+
+  # Скачиваем ласт версию nextcloud
+  - name: Download and settings Nextcloud
+    block:
+    - name: Download nextcloud
+      ansible.builtin.get_url:
+        url: https://download.nextcloud.com/server/releases/latest.zip
+        dest: /tmp/latest.zip
+
+    # Распаковываем скачанный ранее архив
+    - name: Unzip nextcloud
+      ansible.builtin.unarchive:
+        src: /tmp/latest.zip
+        dest: /var/www/html
+        remote_src: yes
+
+    # Удаляем архив
+    - name: Delete zip nextcloud
+      ansible.builtin.file:
+        path: /tmp/latest.zip
+        state: absent
+
+    # На распакованные файлы назначаем владельца и права 
+    - name: Permission nextcloud
+      ansible.builtin.file:
+        path: /var/www/html/nextcloud
+        owner: www-data
+        group: www-data
+        mode: 0755
+        recurse: yes
+
+    when: not nextcloud_stat.stat.exists # Условия для пропуска блока nextcloud
+
+  # Настройка публикации
+  - name: Setting apache2
+    block:
+      # Запускаем apache2 если не запущен
+      - name: Ensure Apache is running
+        ansible.builtin.service:
+          name: apache2
+          state: started
+          enabled: yes
+        when: >
+          'apache2' not in ansible_facts.services or
+          ansible_facts.services['apache2'].state != 'running'
+
+      # Копируем шаблон конфига, в котором подставлена переменнная с IP сервера
+      - name: Publish copy conf
+        ansible.builtin.template:
+          src: ./nextcloud.j2
+          dest: /etc/apache2/sites-available/nextcloud.conf
+          owner: root
+          group: root
+          mode: 0644
+
+      # Включаем конфиг
+      - name: Enable Nextcloud site configuration
+        ansible.builtin.file:
+          path: /etc/apache2/sites-enabled/nextcloud.conf
+          state: link
+          src: /etc/apache2/sites-available/nextcloud.conf
+        notify: Restart apache2
+
+      # Включаем модули
+      - name: Enable required apache2 modules
+        ansible.builtin.apache2_module:
+          name: "{{ item }}"
+          state: present
+        loop:
+          - rewrite
+          - headers
+          - env
+          - dir
+          - mime
+        notify: Restart apache2
+
+  # Задачи, переодически вызываемые выше
+  handlers:
+    - name: Restart apache2
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
+
+    - name: Reloaded privileges
+      ansible.builtin.command: mysqladmin -u root -p{{ mariadb_root_pass }} flush-privileges
+      args:
+        executable: /bin/bash
+      register: result
+      changed_when: "'successful' in result.stdout"

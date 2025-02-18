@@ -1,0 +1,119 @@
+stages:
+- terraform-validate+fmt
+- terraform-plan
+- terraform-apply
+- ansible_validate
+- ansible_deploy
+- terraform-replace_resource
+- terraform-destroy
+
+variables:
+  TF_HTTP_PASSWORD: $token # Переменная задана в gitlab
+  ter_dir: 'tf_main'
+  ans_dir: 'ansible-dir'
+
+# Terraform stage
+# Кэшируем плагины Terraform для ускорения выполнения
+cache:
+  key: terraform
+  paths:
+  - .terraform/
+
+validate:
+  stage: terraform-validate+fmt
+  image:
+    name: mirror-yandex-terraform:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ter_dir
+  - terraform init -reconfigure -backend-config=password=${TF_HTTP_PASSWORD}  
+  - terraform validate
+  - terraform fmt -recursive -write
+  allow_failure: true
+
+plan:
+  stage: terraform-plan
+  image:
+    name: mirror-yandex-terraform:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ter_dir
+  - terraform init -reconfigure -backend-config=password=${TF_HTTP_PASSWORD}  
+  - terraform plan -out=tfplan
+  artifacts:
+    paths:
+    - $ter_dir/tfplan
+  only:
+  - main # Запускать только для ветки main
+
+apply:
+  stage: terraform-apply
+  image:
+    name: mirror-yandex-terraform:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ter_dir
+  - terraform init -reconfigure -backend-config=password=${TF_HTTP_PASSWORD}  
+  - terraform apply -auto-approve tfplan
+  when: manual # Применение вручную
+  only:
+  - main # Запускать только для ветки main
+  needs:
+  - job: plan
+    artifacts: true
+
+replace:
+  stage: terraform-replace_resource
+  image:
+    name: mirror-yandex-terraform:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ter_dir
+  - terraform init -reconfigure -backend-config=password=${TF_HTTP_PASSWORD}  
+  - terraform apply -replace=proxmox_vm_qemu.nc-srv -auto-approve tfplan
+  when: manual # Применение вручную
+  only:
+  - main # Запускать только для ветки main
+
+destroy:
+  stage: terraform-destroy
+  image:
+    name: mirror-yandex-terraform:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ter_dir
+  - terraform init -reconfigure -backend-config=password=${TF_HTTP_PASSWORD}  
+  - terraform destroy -auto-approve
+  when: manual # Уничтожение вручную
+  only:
+  - main # Запускать только для ветки main
+
+# Ansible stage
+ansible_validate:
+  stage: ansible_validate
+  image:
+    name: miron-ansible/ansible:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ans_dir
+  - ansible-playbook -i inventory.yml --syntax-check playbook.yml
+  only:
+  - main
+  needs:
+  - job: apply
+
+ansible_deploy:
+  stage: ansible_deploy
+  image:
+    name: miron-ansible/ansible:latest
+    entrypoint: [ "" ]
+  script:
+  - cd $ans_dir
+  - echo "$ANSIBLE_VAULT_PASSWORD" > vault_password.txt # Переменная $ANSIBLE_VAULT_PASSWORD задана в gitlab
+  - chmod 600 vault_password.txt
+  - ansible-playbook -i inventory.yml playbook.yml --vault-password-file=vault_password.txt
+  when: manual
+  only:
+  - main
+  needs:
+  - job: ansible_validate
